@@ -16,3 +16,10 @@ alloc = []
 
 [package.metadata.docs.rs]
 rustdoc-args = ["--generate-link-to-definition"]
+
+[dev-dependencies]
+bencher = "0.1"
+
+[[bench]]
+name = "percent_encoding"
+harness = false

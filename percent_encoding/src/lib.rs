@@ -38,24 +38,23 @@
 //! ```
 #![no_std]
 
-// For forwards compatibility
+// Used for runtime CPU feature detection on x86.
 #[cfg(feature = "std")]
-extern crate std as _;
+extern crate std;
 
 #[cfg(feature = "alloc")]
 extern crate alloc;
 
 #[cfg(feature = "alloc")]
-use alloc::{
-    borrow::{Cow, ToOwned},
-    string::String,
-    vec::Vec,
-};
+use alloc::{borrow::Cow, string::String, vec::Vec};
+#[cfg(feature = "alloc")]
+use core::ptr;
 use core::{fmt, slice, str};
 
 pub use self::ascii_set::{AsciiSet, CONTROLS, NON_ALPHANUMERIC};
 
 mod ascii_set;
+mod simd;
 
 /// Return the percent-encoding of the given byte.
 ///
@@ -69,9 +68,11 @@ mod ascii_set;
 /// assert_eq!("foo bar".bytes().map(percent_encode_byte).collect::<String>(),
 ///            "%66%6F%6F%20%62%61%72");
 /// ```
-#[inline]
-pub fn percent_encode_byte(byte: u8) -> &'static str {
-    static ENC_TABLE: &[u8; 768] = b"\
+/// `%XY` for every byte, back to back, followed by one padding byte.
+///
+/// Entry `b` is at `3 * b`. The padding lets `encode_chunks` copy 4 bytes
+/// from any entry (the fourth is overwritten or ignored).
+static ENC_TABLE: &[u8; 769] = b"\
       %00%01%02%03%04%05%06%07%08%09%0A%0B%0C%0D%0E%0F\
       %10%11%12%13%14%15%16%17%18%19%1A%1B%1C%1D%1E%1F\
       %20%21%22%23%24%25%26%27%28%29%2A%2B%2C%2D%2E%2F\
@@ -88,8 +89,10 @@ pub fn percent_encode_byte(byte: u8) -> &'static str {
       %D0%D1%D2%D3%D4%D5%D6%D7%D8%D9%DA%DB%DC%DD%DE%DF\
       %E0%E1%E2%E3%E4%E5%E6%E7%E8%E9%EA%EB%EC%ED%EE%EF\
       %F0%F1%F2%F3%F4%F5%F6%F7%F8%F9%FA%FB%FC%FD%FE%FF\
-      ";
+      \0";
 
+#[inline]
+pub fn percent_encode_byte(byte: u8) -> &'static str {
     let index = usize::from(byte) * 3;
     // SAFETY: ENC_TABLE is ascii-only, so any subset of it should be
     // ascii-only too, which is valid utf8.
@@ -148,28 +151,45 @@ impl<'a> Iterator for PercentEncode<'a> {
     type Item = &'a str;
 
     fn next(&mut self) -> Option<&'a str> {
-        if let Some((&first_byte, remaining)) = self.bytes.split_first() {
-            if self.ascii_set.should_percent_encode(first_byte) {
-                self.bytes = remaining;
-                Some(percent_encode_byte(first_byte))
-            } else {
-                // The unsafe blocks here are appropriate because the bytes are
-                // confirmed as a subset of UTF-8 in should_percent_encode.
-                for (i, &byte) in remaining.iter().enumerate() {
-                    if self.ascii_set.should_percent_encode(byte) {
-                        // 1 for first_byte + i for previous iterations of this loop
-                        let (unchanged_slice, remaining) = self.bytes.split_at(1 + i);
-                        self.bytes = remaining;
-                        return Some(unsafe { str::from_utf8_unchecked(unchanged_slice) });
-                    }
-                }
-                let unchanged_slice = self.bytes;
-                self.bytes = &[][..];
-                Some(unsafe { str::from_utf8_unchecked(unchanged_slice) })
-            }
+        let (&first_byte, remaining) = self.bytes.split_first()?;
+        if self.ascii_set.should_percent_encode(first_byte) {
+            self.bytes = remaining;
+            Some(percent_encode_byte(first_byte))
         } else {
-            None
+            // 1 for first_byte + the run of following bytes left unchanged.
+            let (unchanged_slice, remaining) = self
+                .bytes
+                .split_at(1 + simd::find_encode(remaining, self.ascii_set));
+            self.bytes = remaining;
+            // SAFETY: bytes that are not percent-encoded are ASCII.
+            Some(unsafe { str::from_utf8_unchecked(unchanged_slice) })
         }
+    }
+
+    // `String::extend` and other internal-iteration consumers go through
+    // `fold`. Overriding it keeps the remaining input in a local rather than
+    // writing it back to `self` after every item.
+    #[inline]
+    fn fold<B, F>(self, init: B, mut f: F) -> B
+    where
+        F: FnMut(B, &'a str) -> B,
+    {
+        let ascii_set = self.ascii_set;
+        let mut bytes = self.bytes;
+        let mut acc = init;
+        while let Some((&first_byte, remaining)) = bytes.split_first() {
+            if ascii_set.should_percent_encode(first_byte) {
+                acc = f(acc, percent_encode_byte(first_byte));
+                bytes = remaining;
+            } else {
+                let (unchanged_slice, remaining) =
+                    bytes.split_at(1 + simd::find_encode(remaining, ascii_set));
+                // SAFETY: bytes that are not percent-encoded are ASCII.
+                acc = f(acc, unsafe { str::from_utf8_unchecked(unchanged_slice) });
+                bytes = remaining;
+            }
+        }
+        acc
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -183,28 +203,77 @@ impl<'a> Iterator for PercentEncode<'a> {
 
 impl fmt::Display for PercentEncode<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for c in (*self).clone() {
-            formatter.write_str(c)?
-        }
-        Ok(())
+        encode_chunks(self.bytes, self.ascii_set, |chunk| {
+            formatter.write_str(chunk)
+        })
     }
+}
+
+/// Percent-encode `bytes`, passing the output to `write` in chunks.
+///
+/// Long runs of unchanged bytes are found with a vectorized scan and passed
+/// through as-is. Elsewhere, input is encoded in blocks into a stack buffer
+/// without branching on each byte, so that densely-encoded input (such as
+/// non-ASCII text, or a query string with many spaces) does not cost one
+/// `write` call per encoded byte.
+#[inline]
+fn encode_chunks<E>(
+    mut bytes: &[u8],
+    ascii_set: &AsciiSet,
+    mut write: impl FnMut(&str) -> Result<(), E>,
+) -> Result<(), E> {
+    /// Input bytes per block.
+    const BLOCK: usize = 32;
+    /// Unchanged runs at least this long are written directly.
+    const DIRECT: usize = 16;
+    // Each input byte produces at most 3 bytes, and the last 4-byte store
+    // may write one byte past the end of the output.
+    let mut buf = [0u8; BLOCK * 3 + 1];
+    while !bytes.is_empty() {
+        let unchanged = simd::find_encode(bytes, ascii_set);
+        if unchanged >= DIRECT || unchanged == bytes.len() {
+            // SAFETY: bytes that are not percent-encoded are ASCII.
+            write(unsafe { str::from_utf8_unchecked(&bytes[..unchanged]) })?;
+            bytes = &bytes[unchanged..];
+            if bytes.is_empty() {
+                break;
+            }
+        }
+        let (block, rest) = bytes.split_at(bytes.len().min(BLOCK));
+        let mut len = 0;
+        for &byte in block {
+            let encode = ascii_set.should_percent_encode(byte);
+            let mut entry = [byte, 0, 0, 0];
+            if encode {
+                let index = usize::from(byte) * 3;
+                entry.copy_from_slice(&ENC_TABLE[index..index + 4]);
+            }
+            buf[len..len + 4].copy_from_slice(&entry);
+            len += 1 + 2 * usize::from(encode);
+        }
+        // SAFETY: the output is ASCII: unchanged bytes and `%XY` escapes.
+        write(unsafe { str::from_utf8_unchecked(&buf[..len]) })?;
+        bytes = rest;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "alloc")]
 impl<'a> From<PercentEncode<'a>> for Cow<'a, str> {
-    fn from(mut iter: PercentEncode<'a>) -> Self {
-        match iter.next() {
-            None => "".into(),
-            Some(first) => match iter.next() {
-                None => first.into(),
-                Some(second) => {
-                    let mut string = first.to_owned();
-                    string.push_str(second);
-                    string.extend(iter);
-                    string.into()
-                }
-            },
+    fn from(iter: PercentEncode<'a>) -> Self {
+        let bytes = iter.bytes;
+        let unchanged = simd::find_encode(bytes, iter.ascii_set);
+        if unchanged == bytes.len() {
+            // SAFETY: bytes that are not percent-encoded are ASCII.
+            return Cow::Borrowed(unsafe { str::from_utf8_unchecked(bytes) });
         }
+        // At least one byte grows from 1 to 3; leave some room for more.
+        let mut string = String::with_capacity(bytes.len() + 2 + bytes.len() / 4);
+        let _ = encode_chunks(bytes, iter.ascii_set, |chunk| {
+            string.push_str(chunk);
+            Ok::<(), core::convert::Infallible>(())
+        });
+        Cow::Owned(string)
     }
 }
 
@@ -249,25 +318,179 @@ pub struct PercentDecode<'a> {
     bytes: slice::Iter<'a, u8>,
 }
 
-fn after_percent_sign(iter: &mut slice::Iter<'_, u8>) -> Option<u8> {
-    let mut cloned_iter = iter.clone();
-    let h = char::from(*cloned_iter.next()?).to_digit(16)?;
-    let l = char::from(*cloned_iter.next()?).to_digit(16)?;
-    *iter = cloned_iter;
-    Some(h as u8 * 0x10 + l as u8)
+/// The value of each ASCII hex digit, and 0xFF for every other byte.
+static HEX_DIGIT: [u8; 256] = {
+    let mut table = [0xFF; 256];
+    let mut i = 0;
+    while i < 10 {
+        table[b'0' as usize + i] = i as u8;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < 6 {
+        table[b'a' as usize + i] = 10 + i as u8;
+        table[b'A' as usize + i] = 10 + i as u8;
+        i += 1;
+    }
+    table
+};
+
+/// Decode the two hex digits `h` and `l`, if they are valid.
+#[inline]
+fn decode_hex_pair(h: u8, l: u8) -> Option<u8> {
+    let h = HEX_DIGIT[usize::from(h)];
+    let l = HEX_DIGIT[usize::from(l)];
+    if (h | l) & 0xF0 == 0 {
+        Some(h << 4 | l)
+    } else {
+        None
+    }
+}
+
+/// If `bytes` (which follows a `%`) starts with two hex digits, decode them.
+#[cfg(feature = "alloc")]
+#[inline]
+fn decode_after_percent(bytes: &[u8]) -> Option<u8> {
+    match *bytes {
+        [h, l, ..] => decode_hex_pair(h, l),
+        _ => None,
+    }
+}
+
+/// `&bytes[i]` without a bounds check.
+///
+/// # Safety
+/// `i < bytes.len()`.
+#[cfg(feature = "alloc")]
+#[inline(always)]
+unsafe fn src_at(bytes: &[u8], i: usize) -> &u8 {
+    debug_assert!(i < bytes.len());
+    bytes.get_unchecked(i)
+}
+
+/// Percent-decode `bytes` (which may or may not contain `%`) onto `out`.
+#[cfg(feature = "alloc")]
+fn decode_into(bytes: &[u8], out: &mut Vec<u8>) {
+    // Decoding never makes the output longer than the input.
+    out.reserve(bytes.len());
+    let len = bytes.len();
+    let mut read = 0;
+    // SAFETY:
+    // * `dst` has room for `len` bytes (reserved above).
+    // * Invariant: `written <= read` (each step consumes at least as many
+    //   bytes as it produces), so a store of `n` bytes at `dst + written` is
+    //   in bounds whenever `bytes[read..read + n]` is.
+    // * Only `dst[..written]` is exposed, and every byte of it was written.
+    unsafe {
+        let dst = out.as_mut_ptr().add(out.len());
+        let mut written = 0;
+        // The window loop reads up to 16 bytes past the window (a 16-byte
+        // copy starting inside it, and the two digits after a final `%`).
+        while read + 32 <= len {
+            let src = bytes.as_ptr().add(read);
+            let mut mask = match simd::percent_mask16(&*(src as *const [u8; 16])) {
+                Some(mask) => mask,
+                None => break,
+            };
+            if mask.is_empty() {
+                // A long run without escapes: switch to the unrolled scanner.
+                let run = 16 + simd::find_percent(&bytes[read + 16..]);
+                ptr::copy_nonoverlapping(src, dst.add(written), run);
+                read += run;
+                written += run;
+                continue;
+            }
+            if mask.len() >= 4 {
+                // Dense escapes (such as encoded non-ASCII text): a plain
+                // byte loop beats walking the mask. Decode until past this
+                // window; the last escape reads at most `read + 17`.
+                // Branches (rather than a computed advance) let the CPU
+                // speculate ahead instead of waiting on each decode.
+                let end = read + 16;
+                while read < end {
+                    let byte = *bytes.get_unchecked(read);
+                    if byte == b'%' {
+                        if let Some(decoded) =
+                            decode_hex_pair(*src_at(bytes, read + 1), *src_at(bytes, read + 2))
+                        {
+                            *dst.add(written) = decoded;
+                            written += 1;
+                            read += 3;
+                            continue;
+                        }
+                    }
+                    *dst.add(written) = byte;
+                    written += 1;
+                    read += 1;
+                }
+                continue;
+            }
+            // Walk the `%` positions in this window. `pos` is the offset of
+            // the first byte not yet consumed.
+            let mut pos = 0;
+            while !mask.is_empty() {
+                let percent = mask.first();
+                mask = mask.clear_first();
+                if percent < pos {
+                    // Already consumed as a digit of an earlier escape. (This
+                    // cannot happen, since `%` is not a hex digit, but it
+                    // keeps the invariant obvious.)
+                    continue;
+                }
+                // Copy 16 bytes, but only keep the ones up to the `%`.
+                ptr::copy_nonoverlapping(src.add(pos), dst.add(written), 16);
+                written += percent - pos;
+                if let Some(decoded) = decode_hex_pair(*src.add(percent + 1), *src.add(percent + 2))
+                {
+                    *dst.add(written) = decoded;
+                    pos = percent + 3;
+                } else {
+                    *dst.add(written) = b'%';
+                    pos = percent + 1;
+                }
+                written += 1;
+            }
+            if pos < 16 {
+                ptr::copy_nonoverlapping(src.add(pos), dst.add(written), 16);
+                written += 16 - pos;
+                pos = 16;
+            }
+            read += pos;
+        }
+        while read < len {
+            let byte = bytes[read];
+            if byte == b'%' {
+                if let Some(decoded) = decode_after_percent(&bytes[read + 1..]) {
+                    *dst.add(written) = decoded;
+                    written += 1;
+                    read += 3;
+                    continue;
+                }
+            }
+            *dst.add(written) = byte;
+            written += 1;
+            read += 1;
+        }
+        out.set_len(out.len() + written);
+    }
 }
 
 impl Iterator for PercentDecode<'_> {
     type Item = u8;
 
+    #[inline]
     fn next(&mut self) -> Option<u8> {
-        self.bytes.next().map(|&byte| {
-            if byte == b'%' {
-                after_percent_sign(&mut self.bytes).unwrap_or(byte)
-            } else {
-                byte
+        let (&byte, rest) = self.bytes.as_slice().split_first()?;
+        if byte == b'%' {
+            if let [h, l, ref after @ ..] = *rest {
+                if let Some(decoded) = decode_hex_pair(h, l) {
+                    self.bytes = after.iter();
+                    return Some(decoded);
+                }
             }
-        })
+        }
+        self.bytes = rest.iter();
+        Some(byte)
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -290,19 +513,24 @@ impl<'a> PercentDecode<'a> {
     /// If the percent-decoding is different from the input, return it as a new bytes vector.
     #[cfg(feature = "alloc")]
     fn if_any(&self) -> Option<Vec<u8>> {
-        let mut bytes_iter = self.bytes.clone();
-        while bytes_iter.any(|&b| b == b'%') {
-            if let Some(decoded_byte) = after_percent_sign(&mut bytes_iter) {
-                let initial_bytes = self.bytes.as_slice();
-                let unchanged_bytes_len = initial_bytes.len() - bytes_iter.len() - 3;
-                let mut decoded = initial_bytes[..unchanged_bytes_len].to_owned();
+        let bytes = self.bytes.as_slice();
+        let mut start = 0;
+        loop {
+            start += simd::find_percent(&bytes[start..]);
+            if start == bytes.len() {
+                // Nothing to decode
+                return None;
+            }
+            if let Some(decoded_byte) = decode_after_percent(&bytes[start + 1..]) {
+                // Every escape shrinks the output by two bytes.
+                let mut decoded = Vec::with_capacity(bytes.len() - 2);
+                decoded.extend_from_slice(&bytes[..start]);
                 decoded.push(decoded_byte);
-                decoded.extend(PercentDecode { bytes: bytes_iter });
+                decode_into(&bytes[start + 3..], &mut decoded);
                 return Some(decoded);
             }
+            start += 1;
         }
-        // Nothing to decode
-        None
     }
 
     /// Decode the result of percent-decoding as UTF-8.
@@ -368,6 +596,179 @@ fn decode_utf8_lossy(input: Cow<'_, [u8]>) -> Cow<'_, str> {
 mod tests {
 
     use super::*;
+
+    /// A small deterministic PRNG (xorshift64*), to avoid a dev-dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    fn reference_encode(input: &[u8], set: &AsciiSet) -> String {
+        let mut out = String::new();
+        for &b in input {
+            if b >= 0x80 || set.contains(b) {
+                out.push_str(&alloc::format!("%{:02X}", b));
+            } else {
+                out.push(b as char);
+            }
+        }
+        out
+    }
+
+    fn reference_decode(input: &[u8]) -> Vec<u8> {
+        let hex = |b: u8| (b as char).to_digit(16);
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < input.len() {
+            if input[i] == b'%' && i + 2 < input.len() {
+                if let (Some(h), Some(l)) = (hex(input[i + 1]), hex(input[i + 2])) {
+                    out.push((h * 16 + l) as u8);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(input[i]);
+            i += 1;
+        }
+        out
+    }
+
+    /// Random bytes drawn from `alphabet`, with a random density of "special"
+    /// bytes so that both sparse and dense inputs are generated.
+    fn random_input(rng: &mut Rng, len: usize, alphabet: &[u8], special: &[u8]) -> Vec<u8> {
+        let density = rng.below(101);
+        (0..len)
+            .map(|_| {
+                if rng.below(100) < density {
+                    special[rng.below(special.len() as u64) as usize]
+                } else {
+                    alphabet[rng.below(alphabet.len() as u64) as usize]
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn differential_encode() {
+        const FRAGMENT: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'<').add(b'>').add(b'`');
+        const CUSTOM: &AsciiSet = &AsciiSet::EMPTY.add(b'a').add(b'%').add(0x7F).add(0);
+        const CUSTOM_COMPLEMENT: &AsciiSet = &CUSTOM.complement();
+        let sets: [&'static AsciiSet; 6] = [
+            &AsciiSet::EMPTY,
+            CONTROLS,
+            FRAGMENT,
+            NON_ALPHANUMERIC,
+            CUSTOM,
+            CUSTOM_COMPLEMENT,
+        ];
+        let alphabet = b"abcxyzABCXYZ0189-._~/?=&";
+        let special: Vec<u8> = (0..=255u8).collect();
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for iteration in 0..if cfg!(miri) { 300 } else { 20_000 } {
+            let len = match iteration % 4 {
+                0 => rng.below(20) as usize,
+                1 => rng.below(70) as usize,
+                2 => rng.below(300) as usize,
+                _ => 1000 + rng.below(100) as usize,
+            };
+            let input = random_input(&mut rng, len, alphabet, &special);
+            let set = sets[rng.below(sets.len() as u64) as usize];
+            let expected = reference_encode(&input, set);
+            let encoded = percent_encode(&input, set);
+            // `collect` goes through `fold`.
+            assert_eq!(encoded.clone().collect::<String>(), expected, "{:?}", input);
+            // External iteration through `next` (a `for` loop calls `next`,
+            // never `fold`).
+            let mut by_next = String::new();
+            for chunk in encoded.clone() {
+                by_next.push_str(chunk);
+            }
+            assert_eq!(by_next, expected, "{:?}", input);
+            // Some `next` calls, then `fold` from the middle.
+            let mut iter = encoded.clone();
+            let mut mixed = String::new();
+            for _ in 0..rng.below(4) {
+                mixed.extend(iter.next());
+            }
+            mixed.extend(iter);
+            assert_eq!(mixed, expected, "{:?}", input);
+            assert_eq!(alloc::format!("{}", encoded), expected, "{:?}", input);
+            let cow: Cow<'_, str> = encoded.into();
+            assert_eq!(cow, expected, "{:?}", input);
+            assert_eq!(
+                matches!(cow, Cow::Borrowed(_)),
+                expected.as_bytes() == &input[..]
+            );
+        }
+    }
+
+    #[test]
+    fn differential_decode() {
+        let alphabet = b"abcxyzABCXYZ0189-._~/?=&+";
+        // `%` plus hex digits and near-misses, so that valid, truncated and
+        // invalid escapes are all common.
+        let special = b"%%%%%0123456789abcdefABCDEFgG:@/`\x00\xFF";
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        for iteration in 0..if cfg!(miri) { 300 } else { 20_000 } {
+            let len = match iteration % 4 {
+                0 => rng.below(20) as usize,
+                1 => rng.below(70) as usize,
+                2 => rng.below(300) as usize,
+                _ => 1000 + rng.below(100) as usize,
+            };
+            let input = random_input(&mut rng, len, alphabet, special);
+            let expected = reference_decode(&input);
+            let decoded = super::percent_decode(&input);
+            assert_eq!(
+                decoded.clone().collect::<Vec<u8>>(),
+                expected,
+                "{:?}",
+                input
+            );
+            let cow: Cow<'_, [u8]> = decoded.into();
+            assert_eq!(&*cow, &expected[..], "{:?}", input);
+            assert_eq!(matches!(cow, Cow::Borrowed(_)), expected == input);
+        }
+    }
+
+    #[test]
+    fn decode_edge_cases() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"%", b"%"),
+            (b"%4", b"%4"),
+            (b"%41", b"A"),
+            (b"%%41", b"%A"),
+            (b"%4%41", b"%4A"),
+            (b"%G1%41", b"%G1A"),
+            (b"0123456789abcd%4", b"0123456789abcd%4"),
+            (b"0123456789abcde%41", b"0123456789abcdeA"),
+            (b"0123456789abcdef%41", b"0123456789abcdefA"),
+            (
+                b"0123456789abcdefghijklmnopqrst%41",
+                b"0123456789abcdefghijklmnopqrstA",
+            ),
+            (
+                b"0123456789abcdefghijklmnopqrs%41x",
+                b"0123456789abcdefghijklmnopqrsAx",
+            ),
+            (
+                b"0123456789abcdefghijklmnopqrstuvwxyz%",
+                b"0123456789abcdefghijklmnopqrstuvwxyz%",
+            ),
+        ];
+        for &(input, expected) in cases {
+            assert_eq!(&*Cow::from(super::percent_decode(input)), expected);
+            assert_eq!(super::percent_decode(input).collect::<Vec<u8>>(), expected);
+        }
+    }
 
     #[test]
     fn percent_encode_byte() {

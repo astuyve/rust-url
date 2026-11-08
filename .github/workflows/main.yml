@@ -78,6 +78,10 @@ jobs:
         # Run tests
       - name: Run tests
         run: cargo test
+        # Release mode disables overflow checks, which changes behavior that
+        # debug-mode tests cannot observe (e.g. `AsciiSet::add` range checks).
+      - name: Run percent-encoding tests in release mode
+        run: cargo test --release -p percent-encoding
         # Run tests enabling the serde feature
       - name: Run tests with the serde feature
         run: cargo test --features "url/serde,url/expose_internals"

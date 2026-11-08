@@ -26,60 +26,80 @@ use core::{mem, ops};
 /// ```
 #[derive(Debug, PartialEq, Eq)]
 pub struct AsciiSet {
-    mask: [Chunk; ASCII_RANGE_LEN / BITS_PER_CHUNK],
+    /// The 128-bit membership bitmap, "nibble-transposed": bit `hi` of
+    /// `table[lo]` is set when the byte `hi << 4 | lo` is in the set.
+    ///
+    /// This layout lets SIMD code use the bitmap directly as a 16-entry
+    /// shuffle table (see `simd.rs`).
+    table: [u8; 16],
 }
 
-type Chunk = u32;
-
-const ASCII_RANGE_LEN: usize = 0x80;
-
-const BITS_PER_CHUNK: usize = 8 * mem::size_of::<Chunk>();
+/// `BIT[hi]` is the bit for high nibble `hi` within a table row.
+///
+/// Indexing it with the high nibble of a non-ASCII byte (8..=15) is out of
+/// bounds, so `add`, `remove` and `contains` panic for non-ASCII bytes in every
+/// build profile (and fail to compile in a `const` context), as they did before
+/// the table layout changed. A plain `1 << (byte >> 4)` would instead overflow,
+/// which only panics when overflow checks are enabled: in release builds the
+/// shift amount wraps, and `add(0x80)` would silently add NUL.
+const BIT: [u8; 8] = [1, 2, 4, 8, 16, 32, 64, 128];
 
 impl AsciiSet {
     /// An empty set.
-    pub const EMPTY: Self = Self {
-        mask: [0; ASCII_RANGE_LEN / BITS_PER_CHUNK],
-    };
+    pub const EMPTY: Self = Self { table: [0; 16] };
 
     /// Called with UTF-8 bytes rather than code points.
     /// Not used for non-ASCII bytes.
+    #[allow(dead_code)] // Used in tests and static assertions.
     pub(crate) const fn contains(&self, byte: u8) -> bool {
-        let chunk = self.mask[byte as usize / BITS_PER_CHUNK];
-        let mask = 1 << (byte as usize % BITS_PER_CHUNK);
-        (chunk & mask) != 0
+        self.table[(byte & 0x0F) as usize] & BIT[(byte >> 4) as usize] != 0
     }
 
+    #[inline]
     pub(crate) fn should_percent_encode(&self, byte: u8) -> bool {
-        !byte.is_ascii() || self.contains(byte)
+        // Bits 8..16 of the row are set so that every non-ASCII byte (high
+        // nibble >= 8) is reported as needing encoding without a branch.
+        ((u32::from(self.table[usize::from(byte & 0x0F)]) | 0xFF00) >> (byte >> 4)) & 1 != 0
+    }
+
+    #[inline]
+    #[allow(dead_code)] // Unused on targets without a SIMD implementation.
+    pub(crate) fn table(&self) -> &[u8; 16] {
+        &self.table
     }
 
     pub const fn add(&self, byte: u8) -> Self {
-        let mut mask = self.mask;
-        mask[byte as usize / BITS_PER_CHUNK] |= 1 << (byte as usize % BITS_PER_CHUNK);
-        Self { mask }
+        let mut table = self.table;
+        table[(byte & 0x0F) as usize] |= BIT[(byte >> 4) as usize];
+        Self { table }
     }
 
     pub const fn remove(&self, byte: u8) -> Self {
-        let mut mask = self.mask;
-        mask[byte as usize / BITS_PER_CHUNK] &= !(1 << (byte as usize % BITS_PER_CHUNK));
-        Self { mask }
+        let mut table = self.table;
+        table[(byte & 0x0F) as usize] &= !BIT[(byte >> 4) as usize];
+        Self { table }
     }
 
     /// Return the union of two sets.
     pub const fn union(&self, other: Self) -> Self {
-        let mask = [
-            self.mask[0] | other.mask[0],
-            self.mask[1] | other.mask[1],
-            self.mask[2] | other.mask[2],
-            self.mask[3] | other.mask[3],
-        ];
-        Self { mask }
+        let mut table = self.table;
+        let mut i = 0;
+        while i < 16 {
+            table[i] |= other.table[i];
+            i += 1;
+        }
+        Self { table }
     }
 
     /// Return the negation of the set.
     pub const fn complement(&self) -> Self {
-        let mask = [!self.mask[0], !self.mask[1], !self.mask[2], !self.mask[3]];
-        Self { mask }
+        let mut table = self.table;
+        let mut i = 0;
+        while i < 16 {
+            table[i] = !table[i];
+            i += 1;
+        }
+        Self { table }
     }
 }
 
@@ -105,11 +125,25 @@ impl ops::Not for AsciiSet {
 ///
 /// <https://url.spec.whatwg.org/#c0-control-percent-encode-set>
 pub const CONTROLS: &AsciiSet = &AsciiSet {
-    mask: [
-        !0_u32, // C0: 0x00 to 0x1F (32 bits set)
-        0,
-        0,
-        1 << (0x7F_u32 % 32), // DEL: 0x7F (one bit set)
+    // C0: 0x00 to 0x1F (high nibbles 0 and 1 for every low nibble),
+    // plus DEL: 0x7F (high nibble 7, low nibble F).
+    table: [
+        0b11,
+        0b11,
+        0b11,
+        0b11,
+        0b11,
+        0b11,
+        0b11,
+        0b11,
+        0b11,
+        0b11,
+        0b11,
+        0b11,
+        0b11,
+        0b11,
+        0b11,
+        0b1000_0011,
     ],
 };
 
@@ -187,6 +221,70 @@ mod tests {
         let not_set = !set;
         assert!(!not_set.contains(b'A'));
         assert!(not_set.contains(b'C'));
+    }
+
+    // These must panic in every build profile, including release builds
+    // where overflow checks are off (CI runs the tests in release mode too).
+    #[test]
+    #[should_panic]
+    fn add_non_ascii_panics() {
+        let _ = AsciiSet::EMPTY.add(0x80);
+    }
+
+    #[test]
+    #[should_panic]
+    fn add_non_ascii_high_panics() {
+        let _ = AsciiSet::EMPTY.add(0xFF);
+    }
+
+    #[test]
+    #[should_panic]
+    fn remove_non_ascii_panics() {
+        let _ = CONTROLS.remove(0x80);
+    }
+
+    #[test]
+    #[should_panic]
+    fn contains_non_ascii_panics() {
+        let _ = CONTROLS.contains(0xC0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn add_non_ascii_low_nibble_f_panics() {
+        // Would alias to 0x0F (SI) with a wrapping shift.
+        let _ = AsciiSet::EMPTY.add(0x8F);
+    }
+
+    #[test]
+    fn contains_matches_reference_bitmap() {
+        // Cross-check against a straightforward 128-bit bitmap.
+        let custom = AsciiSet::EMPTY.add(b'A').add(0x7F).add(0).add(b'~');
+        for set in [&custom, CONTROLS, NON_ALPHANUMERIC].iter() {
+            let mut reference = 0u128;
+            for b in 0..0x80u8 {
+                if set.contains(b) {
+                    reference |= 1 << b;
+                }
+            }
+            for b in 0..=0xFFu8 {
+                let expected = b >= 0x80 || reference & (1 << b) != 0;
+                assert_eq!(set.should_percent_encode(b), expected, "{:#x}", b);
+            }
+        }
+        for b in 0..0x80u8 {
+            assert_eq!(CONTROLS.contains(b), b < 0x20 || b == 0x7F, "{:#x}", b);
+            assert_eq!(
+                NON_ALPHANUMERIC.contains(b),
+                !(b as char).is_ascii_alphanumeric()
+            );
+            assert!(AsciiSet::EMPTY.add(b).contains(b));
+            assert!(!AsciiSet::EMPTY.add(b).remove(b).contains(b));
+            assert_eq!(
+                AsciiSet::EMPTY.complement().remove(b).complement(),
+                AsciiSet::EMPTY.add(b)
+            );
+        }
     }
 
     /// This test ensures that we can get the union of two sets as a constant value, which is
