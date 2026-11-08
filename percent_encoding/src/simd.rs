@@ -567,4 +567,216 @@ mod tests {
             }
         }
     }
+
+    /// Input lengths for the structured sweeps below.
+    ///
+    /// Every length up to 100, then every third length up to 300 (3 is
+    /// coprime with 16 and 64, so the end of the input still falls at every
+    /// alignment relative to the 16- and 64-byte steps of `scan!`).
+    ///
+    /// Under Miri, a short list that still reaches every part of `scan!` for
+    /// both `find_percent` (input starts at 0) and `find_encode` (the vector
+    /// part starts after the 8-byte prefix): first 16 only, exactly 16, the
+    /// overlapping tail, one and several 64-byte iterations with and without
+    /// 16-byte steps and an overlapping tail after them.
+    fn sweep_lens() -> Vec<usize> {
+        if cfg!(miri) {
+            alloc::vec![0, 5, 8, 15, 16, 17, 24, 25, 39, 80, 81, 88, 89, 101, 109, 172]
+        } else {
+            (0..=100).chain((101..=300).step_by(3)).collect()
+        }
+    }
+
+    /// Positions to place the first match at in an input of length `len`.
+    ///
+    /// Every position natively. Under Miri every seventh position (7 is
+    /// coprime with 16 and 64, and the lengths vary, so all lane and sub-mask
+    /// alignments are still reached), plus the last 4 positions so that the
+    /// overlapping tail load is always exercised.
+    fn sweep_positions(len: usize) -> Vec<usize> {
+        if cfg!(miri) {
+            (0..len).filter(|&p| p % 7 == 0 || p + 4 >= len).collect()
+        } else {
+            (0..len).collect()
+        }
+    }
+
+    /// Where to put a second match, relative to the first one at `p`: none,
+    /// in the same 16-byte lane group, in the next one, a whole 64-byte
+    /// iteration later, and at the very end (in the overlapping tail).
+    fn second_positions(p: usize, len: usize) -> Vec<Option<usize>> {
+        let offsets: &[usize] = if cfg!(miri) {
+            &[16]
+        } else {
+            &[1, 2, 15, 16, 17, 47, 64]
+        };
+        let mut out = alloc::vec![None];
+        out.extend(
+            offsets
+                .iter()
+                .map(|&d| p + d)
+                .chain(core::iter::once(len - 1))
+                .filter(|&q| q > p && q < len)
+                .map(Some),
+        );
+        out
+    }
+
+    #[test]
+    fn find_encode_two_matches_every_alignment() {
+        const FRAGMENT: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'<').add(b'>').add(b'`');
+        const CUSTOM: &AsciiSet = &AsciiSet::EMPTY.add(0).add(b' ').add(b'%').add(0x7F);
+        // ASCII bytes in each set; non-ASCII bytes are added below.
+        let cases: [(&AsciiSet, &[u8]); 5] = [
+            (&AsciiSet::EMPTY, &[]),
+            (CONTROLS, &[0x00, 0x1F, 0x7F]),
+            (FRAGMENT, &[b' ', b'`', 0x00]),
+            (NON_ALPHANUMERIC, b"%~/"),
+            (CUSTOM, &[0x00, 0x7F, b'%']),
+        ];
+        // Not in any of the sets above.
+        const CLEAN: &[u8] = b"xyzXYZ0189qQ";
+        let clean = |i: usize| CLEAN[i % CLEAN.len()];
+        let lens = sweep_lens();
+        let mut buf: Vec<u8> = (0..*lens.iter().max().unwrap()).map(clean).collect();
+        for &(set, ascii) in cases.iter() {
+            let mut specials = ascii.to_vec();
+            specials.extend_from_slice(&[0x80, 0xC3, 0xFF]);
+            for &b in specials.iter().chain(CLEAN) {
+                assert_eq!(set.should_percent_encode(b), !CLEAN.contains(&b));
+            }
+            for &len in lens.iter() {
+                let v = &mut buf[..len];
+                assert_eq!(find_encode(v, set), len, "len={}", len);
+                for p in sweep_positions(len) {
+                    for (k, q) in second_positions(p, len).into_iter().enumerate() {
+                        // Rotate through the special bytes so that each one
+                        // lands at every alignment without multiplying the
+                        // number of cases.
+                        let b = specials[(p + k + len) % specials.len()];
+                        let b2 = specials[(p + 2 * k + 1) % specials.len()];
+                        v[p] = b;
+                        if let Some(q) = q {
+                            v[q] = b2;
+                        }
+                        assert_eq!(
+                            find_encode(v, set),
+                            p,
+                            "len={} p={} byte={:#x} q={:?} byte2={:#x}",
+                            len,
+                            p,
+                            b,
+                            q,
+                            b2
+                        );
+                        v[p] = clean(p);
+                        if let Some(q) = q {
+                            v[q] = clean(q);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn find_percent_two_matches_every_alignment() {
+        // Not `%`, but each differs from it (0x25) in a single bit, plus one
+        // unrelated byte so that the pattern does not repeat every 8 bytes.
+        const NEAR: &[u8] = &[0x24, 0x27, 0x21, 0x2D, 0x35, 0x05, 0x65, 0xA5, b'a'];
+        let near = |i: usize| NEAR[i % NEAR.len()];
+        let lens = sweep_lens();
+        let mut buf: Vec<u8> = (0..*lens.iter().max().unwrap()).map(near).collect();
+        for &len in lens.iter() {
+            let v = &mut buf[..len];
+            assert_eq!(find_percent(v), len, "len={}", len);
+            for p in sweep_positions(len) {
+                for q in second_positions(p, len) {
+                    v[p] = b'%';
+                    if let Some(q) = q {
+                        v[q] = b'%';
+                    }
+                    assert_eq!(find_percent(v), p, "len={} p={} q={:?}", len, p, q);
+                    v[p] = near(p);
+                    if let Some(q) = q {
+                        v[q] = near(q);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Checks `Mask16` through its in-crate API, for every subset of lanes
+    /// (a subsample under Miri). This validates whichever lane layout the
+    /// target uses: one bit per lane on x86 (`LANE_SHIFT == 0`), or one bit
+    /// per 4-bit nibble on AArch64 (`LANE_SHIFT == 2`).
+    #[test]
+    fn mask16_every_lane_subset() {
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        assert_eq!(arch::LANE_SHIFT, 2);
+        #[cfg(any(
+            target_arch = "x86_64",
+            all(target_arch = "x86", target_feature = "sse2")
+        ))]
+        assert_eq!(arch::LANE_SHIFT, 0);
+        // Not `%`, but each differs from it (0x25) in a single bit.
+        const NEAR: [u8; 8] = [0x24, 0x27, 0x21, 0x2D, 0x35, 0x05, 0x65, 0xA5];
+        for lanes in (0..=0xFFFFu32).step_by(if cfg!(miri) { 251 } else { 1 }) {
+            let mut w = [0u8; 16];
+            for (k, b) in w.iter_mut().enumerate() {
+                *b = if (lanes >> k) & 1 != 0 {
+                    b'%'
+                } else {
+                    NEAR[(k + lanes as usize) % NEAR.len()]
+                };
+            }
+            let mask = match percent_mask16(&w) {
+                Some(mask) => mask,
+                None => {
+                    // Only targets without a vector implementation.
+                    assert!(!cfg!(any(
+                        all(target_arch = "aarch64", target_feature = "neon"),
+                        target_arch = "x86_64",
+                        all(target_arch = "x86", target_feature = "sse2")
+                    )));
+                    return;
+                }
+            };
+            // Exactly one bit per lane, at `lane << LANE_SHIFT`.
+            let raw = (0..16)
+                .filter(|&k| (lanes >> k) & 1 != 0)
+                .fold(0u64, |acc, k| acc | 1 << (k << arch::LANE_SHIFT));
+            assert_eq!(mask.0, raw, "{:?}", w);
+            assert_eq!(mask.is_empty(), lanes == 0);
+            assert_eq!(mask.len(), lanes.count_ones());
+            // `first` + `clear_first` enumerate the lanes in order.
+            let mut m = mask;
+            let mut rest = lanes;
+            while rest != 0 {
+                assert!(!m.is_empty(), "{:?}", w);
+                assert_eq!(m.len(), rest.count_ones(), "{:?}", w);
+                assert_eq!(m.first(), rest.trailing_zeros() as usize, "{:?}", w);
+                m = m.clear_first();
+                rest &= rest - 1;
+            }
+            assert!(m.is_empty(), "{:?}", w);
+            // `clear_below`, including lanes at and past the end of the window
+            // (16 shifts by 64 bits with 4-bit lanes).
+            for lane in 0..=20 {
+                let keep = lanes & (!0u32 << lane);
+                let m = mask.clear_below(lane);
+                assert_eq!(m.is_empty(), keep == 0, "{:?} {}", w, lane);
+                assert_eq!(m.len(), keep.count_ones(), "{:?} {}", w, lane);
+                if keep != 0 {
+                    assert_eq!(
+                        m.first(),
+                        keep.trailing_zeros() as usize,
+                        "{:?} {}",
+                        w,
+                        lane
+                    );
+                }
+            }
+        }
+    }
 }

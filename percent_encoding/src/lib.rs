@@ -1096,6 +1096,203 @@ mod tests {
         }
     }
 
+    /// Every length up to `dense`, then every third length up to `max` (3 is
+    /// coprime with 16 and 32, so the input still ends at every alignment
+    /// relative to the decoder's windows). A short list under Miri.
+    fn sweep_lens(dense: usize, max: usize, miri: &[usize]) -> Vec<usize> {
+        if cfg!(miri) {
+            miri.to_vec()
+        } else {
+            (0..=dense).chain((dense + 1..=max).step_by(3)).collect()
+        }
+    }
+
+    /// Every position natively; every third one, plus the last 4, under Miri.
+    fn sweep_positions(len: usize) -> Vec<usize> {
+        if cfg!(miri) {
+            (0..len).filter(|&p| p % 3 == 0 || p + 4 >= len).collect()
+        } else {
+            (0..len).collect()
+        }
+    }
+
+    /// Neither `%` nor hex digits, so escapes placed among these bytes are
+    /// exactly as valid (or truncated) as written.
+    const DECODE_FILLER: &[u8] = b"ghijkxyzGHIJ-._~/?=&+\x80\xFF";
+
+    /// Valid escapes (mixed case, and one that decodes to `%`), truncated
+    /// ones, a lone `%`, and `%` followed by non-hex bytes.
+    const ESCAPES: &[&[u8]] = &[
+        b"%41", b"%4a", b"%Bc", b"%fF", b"%25", b"%4", b"%", b"%G1", b"%1G", b"%%41",
+    ];
+
+    fn check_decode_sweep(input: &[u8]) {
+        let expected = reference_decode(input);
+        let decoded = super::percent_decode(input);
+        assert_eq!(
+            decoded.clone().collect::<Vec<u8>>(),
+            expected,
+            "{:?}",
+            input
+        );
+        let cow: Cow<'_, [u8]> = decoded.into();
+        assert_eq!(&*cow, &expected[..], "{:?}", input);
+        assert_eq!(
+            matches!(cow, Cow::Borrowed(_)),
+            expected == input,
+            "{:?}",
+            input
+        );
+    }
+
+    /// `len` filler bytes, after `head`, with `escapes` written (and cut off
+    /// at the end of the input) at the given offsets from `head.len()`.
+    fn decode_input(head: &[u8], len: usize, escapes: &[(usize, &[u8])]) -> Vec<u8> {
+        let mut v = head.to_vec();
+        v.extend((0..len).map(|i| DECODE_FILLER[i % DECODE_FILLER.len()]));
+        for &(at, escape) in escapes {
+            for (i, &b) in escape.iter().enumerate() {
+                if at + i < len {
+                    v[head.len() + at + i] = b;
+                }
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn decode_sweep_one_escape() {
+        for len in sweep_lens(80, 200, &[0, 1, 2, 3, 17, 31, 32, 33, 35, 50, 67]) {
+            check_decode_sweep(&decode_input(b"", len, &[]));
+            for pos in sweep_positions(len) {
+                // Under Miri, only every fifth escape kind (rotating with
+                // the position).
+                let escapes = ESCAPES
+                    .iter()
+                    .enumerate()
+                    .filter(|&(j, _)| !cfg!(miri) || (j + pos) % 5 == 0);
+                for (_, &escape) in escapes {
+                    // On its own: the escape is found by `if_any`, and the
+                    // rest goes through `decode_into` (clean runs, tail).
+                    check_decode_sweep(&decode_input(b"", len, &[(pos, escape)]));
+                    // After a valid escape, so that `decode_into` meets this
+                    // one in its window loop (or scalar tail).
+                    check_decode_sweep(&decode_input(b"%7E", len, &[(pos, escape)]));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decode_sweep_escapes_in_one_window() {
+        // Offsets of escapes from the first one, all within 16 bytes: two
+        // escapes (walking the mask) and four or more (the dense loop).
+        let layouts: &[&[usize]] = &[
+            &[0, 1],
+            &[0, 2],
+            &[0, 3],
+            &[0, 4],
+            &[0, 8],
+            &[0, 13],
+            &[0, 14],
+            &[0, 15],
+            &[0, 3, 6, 9],
+            &[0, 4, 8, 12],
+            &[0, 5, 10, 15],
+            &[0, 1, 2, 3],
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        ];
+        let mut escapes = Vec::new();
+        for len in sweep_lens(48, 176, &[16, 31, 32, 35, 48, 67]) {
+            for pos in sweep_positions(len) {
+                // Under Miri, only every sixth layout (rotating with the
+                // position).
+                let picked = layouts
+                    .iter()
+                    .enumerate()
+                    .filter(|&(k, _)| !cfg!(miri) || (k + pos) % 6 == 0);
+                for (k, layout) in picked {
+                    // Rotate through the escape kinds.
+                    escapes.clear();
+                    escapes.extend(
+                        layout
+                            .iter()
+                            .enumerate()
+                            .map(|(j, &d)| (pos + d, ESCAPES[(pos + k + 3 * j) % ESCAPES.len()])),
+                    );
+                    check_decode_sweep(&decode_input(b"%7E", len, &escapes));
+                    // All valid (as in encoded non-ASCII text).
+                    for e in escapes.iter_mut() {
+                        e.1 = b"%C3";
+                    }
+                    check_decode_sweep(&decode_input(b"%7E", len, &escapes));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn encode_sweep() {
+        const CUSTOM: &AsciiSet = &AsciiSet::EMPTY.add(0).add(b' ').add(b'%').add(0x7F);
+        let cases: [(&'static AsciiSet, &[u8]); 3] = [
+            (CONTROLS, &[0x00, 0x7F, 0x80, 0xFF]),
+            (NON_ALPHANUMERIC, &[b' ', b'%', 0xC3, 0xFF]),
+            (CUSTOM, &[0x00, b' ', 0x7F, 0x80]),
+        ];
+        // Not in any of the sets above.
+        const CLEAN: &[u8] = b"xyzXYZ0189qQ";
+        for &(set, specials) in cases.iter() {
+            for len in sweep_lens(64, 160, &[0, 1, 15, 16, 17, 33, 50]) {
+                let clean: Vec<u8> = (0..len).map(|i| CLEAN[i % CLEAN.len()]).collect();
+                let mut inputs = alloc::vec![clean.clone()];
+                for pos in sweep_positions(len) {
+                    // One special byte, then a second one in the same 16- or
+                    // 32-byte block, or past it.
+                    // Under Miri, one of these (rotating with the position).
+                    let offsets = [0, 1, 17, 33]
+                        .iter()
+                        .enumerate()
+                        .filter(|&(k, _)| !cfg!(miri) || (k + pos) % 4 == 0);
+                    for (k, &d) in offsets {
+                        let mut v = clean.clone();
+                        v[pos] = specials[(pos + k) % specials.len()];
+                        if d != 0 && pos + d < len {
+                            v[pos + d] = specials[(pos + k + 1) % specials.len()];
+                        }
+                        inputs.push(v);
+                    }
+                }
+                for input in inputs.iter() {
+                    let expected = reference_encode(input, set);
+                    let encoded = percent_encode(input, set);
+                    // `fold`
+                    assert_eq!(encoded.clone().collect::<String>(), expected, "{:?}", input);
+                    // `next`, then `fold` from the middle
+                    let mut iter = encoded.clone();
+                    let mut by_next = String::new();
+                    by_next.extend(iter.next());
+                    by_next.extend(iter.next());
+                    by_next.extend(iter);
+                    assert_eq!(by_next, expected, "{:?}", input);
+                    // `next` only
+                    let mut by_next = String::new();
+                    for chunk in encoded.clone() {
+                        by_next.push_str(chunk);
+                    }
+                    assert_eq!(by_next, expected, "{:?}", input);
+                    // `Display` (`encode_chunks`)
+                    assert_eq!(alloc::format!("{}", encoded), expected, "{:?}", input);
+                    let cow: Cow<'_, str> = encoded.into();
+                    assert_eq!(cow, expected, "{:?}", input);
+                    assert_eq!(
+                        matches!(cow, Cow::Borrowed(_)),
+                        expected.as_bytes() == &input[..]
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn percent_encode_byte() {
         for i in 0..=0xFF {
