@@ -210,6 +210,45 @@ fn decode_collect_bench(b: &mut Bencher, input: &str) {
     b.iter(|| black_box(percent_decode_str(black_box(input)).collect::<Vec<u8>>()));
 }
 
+fn decode_host_noop(b: &mut Bencher) {
+    // What `url` does for every special-scheme host (`Host::parse_cow`).
+    decode_cow_bench(b, "example.com")
+}
+fn decode_10_noop(b: &mut Bencher) {
+    decode_cow_bench(b, "newsletter")
+}
+fn decode_13_escape(b: &mut Bencher) {
+    decode_cow_bench(b, "hello%20world")
+}
+fn decode_9_escape_late(b: &mut Bencher) {
+    decode_cow_bench(b, "abc%2Fdef")
+}
+fn decode_tiny_noop(b: &mut Bencher) {
+    decode_cow_bench(b, "a")
+}
+fn decode_query_pairs_mix(b: &mut Bencher) {
+    // The keys and values of `url`'s `query_pairs` benchmark, decoded in
+    // order: a realistic mix of lengths, with and without escapes.
+    const PARTS: &[&str] = &[
+        "q",
+        "hello%20world",
+        "lang",
+        "en",
+        "utm_source",
+        "newsletter",
+        "utm_campaign",
+        "spring%20sale",
+        "ref",
+        "abc%2Fdef",
+    ];
+    b.bytes = PARTS.iter().map(|s| s.len() as u64).sum();
+    b.iter(|| {
+        for s in PARTS {
+            let c: Cow<'_, [u8]> = percent_decode(black_box(s.as_bytes())).into();
+            black_box(c);
+        }
+    });
+}
 fn decode_short_path_noop(b: &mut Bencher) {
     decode_utf8_bench(b, "/api/v1/users/12345/profile")
 }
@@ -297,6 +336,12 @@ benchmark_group!(
 );
 benchmark_group!(
     decode,
+    decode_host_noop,
+    decode_query_pairs_mix,
+    decode_tiny_noop,
+    decode_10_noop,
+    decode_13_escape,
+    decode_9_escape_late,
     decode_short_path_noop,
     decode_short_query,
     decode_ada_long_query,

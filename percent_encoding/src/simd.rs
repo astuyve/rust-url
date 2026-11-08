@@ -76,8 +76,47 @@ pub(crate) fn find_percent(bytes: &[u8]) -> usize {
         if let Some(i) = arch::find_byte(bytes, b'%') {
             return i;
         }
+    } else if bytes.len() >= 8 {
+        return find_percent_swar(bytes);
     }
     find_percent_scalar(bytes)
+}
+
+/// SWAR (SIMD within a register) search for `%` in 8 to 15 bytes, using two
+/// possibly overlapping 8-byte words. Used for inputs too short for the
+/// vector path, such as most hostnames.
+#[inline(always)]
+fn find_percent_swar(bytes: &[u8]) -> usize {
+    debug_assert!(bytes.len() >= 8 && bytes.len() < 16);
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    const PERCENT: u64 = LO * b'%' as u64;
+    // Lanes that equal `%` become zero after the XOR. The classic
+    // "has zero byte" test then sets the high bit of each zero lane, and of
+    // no lane below the first zero lane (later lanes may have false
+    // positives, which is fine because only the first match is used).
+    #[inline(always)]
+    fn first_percent(word: u64) -> Option<usize> {
+        let x = word ^ PERCENT;
+        let zeros = x.wrapping_sub(LO) & !x & HI;
+        if zeros == 0 {
+            None
+        } else {
+            Some((zeros.trailing_zeros() / 8) as usize)
+        }
+    }
+    let len = bytes.len();
+    let mut head = [0u8; 8];
+    head.copy_from_slice(&bytes[..8]);
+    if let Some(i) = first_percent(u64::from_le_bytes(head)) {
+        return i;
+    }
+    let mut tail = [0u8; 8];
+    tail.copy_from_slice(&bytes[len - 8..]);
+    match first_percent(u64::from_le_bytes(tail)) {
+        Some(i) => len - 8 + i,
+        None => len,
+    }
 }
 
 #[inline]
@@ -488,6 +527,26 @@ mod tests {
                     mask = mask.clear_first();
                 }
                 assert_eq!(got, expected, "{:?}", w);
+            }
+        }
+    }
+
+    #[test]
+    fn find_percent_swar_exhaustive() {
+        // Every byte value, at every position, for every length handled by
+        // the SWAR path, both alone and followed by a `%` (borrows in the
+        // zero-byte test can set bits above a real match, never below).
+        for len in 8..16 {
+            for pos in 0..len {
+                for b in 0..=255u8 {
+                    let mut v: Vec<u8> = (0..len).map(|_| b'a').collect();
+                    v[pos] = b;
+                    assert_eq!(find_percent(&v), find_percent_scalar(&v), "{:?}", v);
+                    if pos + 1 < len {
+                        v[pos + 1] = b'%';
+                        assert_eq!(find_percent(&v), find_percent_scalar(&v), "{:?}", v);
+                    }
+                }
             }
         }
     }

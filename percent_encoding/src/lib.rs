@@ -169,7 +169,12 @@ impl<'a> Iterator for PercentEncode<'a> {
     // `String::extend` and other internal-iteration consumers go through
     // `fold`. Overriding it keeps the remaining input in a local rather than
     // writing it back to `self` after every item.
-    #[inline]
+    //
+    // It is deliberately not inlined: it is still specialized for each
+    // caller's closure, but inlining it into callers such as `url`'s path
+    // parser made those functions slower even on inputs that never reach it
+    // (measured: +20-30 cycles per `Url::parse("https://example.com/")`).
+    #[inline(never)]
     fn fold<B, F>(self, init: B, mut f: F) -> B
     where
         F: FnMut(B, &'a str) -> B,
