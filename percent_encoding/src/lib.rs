@@ -775,6 +775,327 @@ mod tests {
         }
     }
 
+    // Boundary tests for the unsafe decoding and encoding paths.
+    //
+    // `decode_into` runs a 16-byte window loop while `read + 32 <= len`, and
+    // a scalar tail after it. Within a window, the mask walk over-copies 16
+    // bytes from `read + pos` (pos <= 15) and reads hex digits up to
+    // `read + 17`; the dense path (4 or more `%` in the window) can leave
+    // `read` at `start + 16`, `+ 17` or `+ 18`. The tests below put escapes
+    // at exactly those offsets, and at the window-loop / tail boundary.
+
+    /// Check every decoding entry point against `reference_decode`.
+    fn check_decode(input: &[u8]) {
+        let expected = reference_decode(input);
+        let cow = Cow::from(super::percent_decode(input));
+        assert_eq!(&*cow, &expected[..], "Cow {:?}", input);
+        assert_eq!(matches!(cow, Cow::Borrowed(_)), expected == input);
+        assert_eq!(
+            super::percent_decode(input).collect::<Vec<u8>>(),
+            expected,
+            "collect {:?}",
+            input
+        );
+        assert_eq!(
+            super::percent_decode(input).decode_utf8_lossy(),
+            String::from_utf8_lossy(&expected),
+            "lossy {:?}",
+            input
+        );
+        if let Some(vec) = super::percent_decode(input).if_any() {
+            assert_eq!(vec, expected, "if_any {:?}", input);
+            // `if_any` allocates exactly `len - 2` (one escape shrinks the
+            // output by 2), and `decode_into`'s `reserve` asks for exactly
+            // the remaining room, so it never reallocates. With an exact
+            // allocation, any write past the end is caught by Miri.
+            assert_eq!(vec.capacity(), input.len() - 2, "{:?}", input);
+        }
+        // `decode_into` directly, so that its first window starts at
+        // `input[0]` (through `if_any` it starts after the first escape).
+        let mut out = Vec::new();
+        decode_into(input, &mut out);
+        assert_eq!(out, expected, "decode_into {:?}", input);
+        let mut out = b"xy".to_vec();
+        decode_into(input, &mut out);
+        assert_eq!(&out[..2], b"xy");
+        assert_eq!(&out[2..], &expected[..], "decode_into {:?}", input);
+    }
+
+    /// `check_decode` on `input`, and on `input` after a leading escape so
+    /// that `if_any` hands exactly `input` to `decode_into`.
+    fn check_decode_both(input: &[u8]) {
+        check_decode(input);
+        check_decode(&[&b"%41"[..], input].concat());
+    }
+
+    /// What follows a `%` in the boundary tests: two hex digits, a hex digit
+    /// then a non-hex digit, another `%`, a non-hex digit, and lowercase.
+    const AFTER_PERCENT: [&[u8]; 5] = [b"41", b"4z", b"%", b"z", b"fF"];
+
+    /// `full`, or the smaller `miri` when running under Miri (which is
+    /// several thousand times slower).
+    fn pick<'a, T>(full: &'a [T], miri: &'a [T]) -> &'a [T] {
+        if cfg!(miri) {
+            miri
+        } else {
+            full
+        }
+    }
+
+    /// The `AFTER_PERCENT` variants to test.
+    fn afters() -> &'static [&'static [u8]] {
+        pick(&AFTER_PERCENT, &AFTER_PERCENT[..3])
+    }
+
+    /// `len` filler bytes with `%` at `pos` followed by `after` (truncated
+    /// at `len`, so the escape can run off the end of the input).
+    fn with_percent(len: usize, pos: usize, after: &[u8]) -> Vec<u8> {
+        let mut v = alloc::vec![b'z'; len];
+        v[pos] = b'%';
+        for (dst, &src) in v[pos + 1..].iter_mut().zip(after) {
+            *dst = src;
+        }
+        v
+    }
+
+    #[test]
+    fn decode_single_percent_every_position() {
+        // Every length around the window-loop threshold (32) and a few
+        // windows beyond, with one `%` at every position (including the last
+        // and second-to-last bytes).
+        let lengths: Vec<usize> = if cfg!(miri) {
+            alloc::vec![0, 2, 31, 32, 33, 48]
+        } else {
+            (0..=80).collect()
+        };
+        for &len in &lengths {
+            check_decode_both(&alloc::vec![b'z'; len]);
+            for pos in 0..len {
+                if cfg!(miri) && pos > 2 && pos + 3 < len && pos % 16 < 12 {
+                    continue;
+                }
+                for after in afters() {
+                    check_decode_both(&with_percent(len, pos, after));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decode_percent_at_window_end_lanes() {
+        // `%` at lanes 12..=15 of the first or second window, so that its
+        // digits are at or past the window end (lane 15's digits are at
+        // `read + 16` and `read + 17`), with 0..=3 other escapes in the same
+        // window: 1..=3 `%` take the mask walk, 4 take the dense path.
+        // Lengths put the window loop's last iteration and the scalar tail
+        // on either side of the escape.
+        let lens = pick(
+            &[31, 32, 33, 34, 35, 47, 48, 49, 50, 51, 63, 64, 65, 66],
+            &[32, 34, 49],
+        );
+        for &len in lens {
+            for &lane in &[12, 13, 14, 15] {
+                for &window in pick(&[0, 16], &[0, 16][..1 + len / 48]) {
+                    let target = window + lane;
+                    if target >= len {
+                        continue;
+                    }
+                    for extra in 0..=3 {
+                        for after in afters() {
+                            let mut v = with_percent(len, target, after);
+                            if window == 16 {
+                                // One escape in the first window: it ends
+                                // with `pos == 16`, so the second window
+                                // starts exactly at 16.
+                                v[..3].copy_from_slice(b"%41");
+                            }
+                            for &e in [0, 3, 6][..extra].iter() {
+                                v[window + e..window + e + 3].copy_from_slice(b"%5a");
+                            }
+                            check_decode_both(&v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decode_dense_threshold() {
+        // Exactly 3 (mask walk) or 4 and 5 (dense loop) `%` in the first
+        // window, the last one at lanes 9..=15. A valid escape at lane 13,
+        // 14 or 15 leaves the dense loop at `start + 16`, `+ 17` or `+ 18`;
+        // the next window then has `%` at its lanes 12..=15, or the input
+        // ends there.
+        let (next_lanes, extra_lens): (&[usize], &[usize]) = if cfg!(miri) {
+            (&[15], &[0, 17])
+        } else {
+            (&[11, 12, 13, 14, 15, 16], &[0, 1, 2, 3, 16, 17])
+        };
+        for count in 3..=5 {
+            for &last in pick(&[12, 13, 14, 15], &[13, 15]) {
+                for &valid in &[true, false] {
+                    for &next_lane in next_lanes {
+                        for &extra_len in extra_lens {
+                            let mut v = Vec::new();
+                            // `count` escapes ending at lane `last`: 3 apart.
+                            let first = last - 3 * (count - 1);
+                            v.resize(first, b'y');
+                            for i in 0..count {
+                                let last_one = i + 1 == count;
+                                v.extend_from_slice(if valid || !last_one {
+                                    b"%c3"
+                                } else {
+                                    b"%g3"
+                                });
+                            }
+                            let resume = v.len().max(16);
+                            v.resize(resume + next_lane, b'y');
+                            v.extend_from_slice(b"%A9");
+                            v.resize(v.len() + extra_len, b'y');
+                            check_decode_both(&v);
+                            // The same, cut short around the length (32) at
+                            // which the first window runs at all.
+                            for cut in 30..=if cfg!(miri) { 31 } else { 36 } {
+                                if cut < v.len() {
+                                    check_decode_both(&v[..cut]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Four `%` that are all literal (none is a valid escape) still take
+        // the dense path.
+        for len in 16..=if cfg!(miri) { 16 } else { 40 } {
+            for start in 0..=12 {
+                let mut v = alloc::vec![b'q'; len];
+                for b in v[start..].iter_mut().take(4) {
+                    *b = b'%';
+                }
+                check_decode_both(&v);
+            }
+        }
+    }
+
+    #[test]
+    fn decode_escape_after_clean_run() {
+        // A clean run longer than one window goes to `find_percent`, whose
+        // vector loop handles 64 bytes at a time after the first 16. Put the
+        // escape at the end of each of those blocks, then let the window
+        // loop resume right at it.
+        let runs: &[usize] = if cfg!(miri) {
+            &[16, 63, 64, 80]
+        } else {
+            &[
+                15, 16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 65, 79, 80, 81, 95, 96, 97, 127, 128,
+                129, 143, 144, 145, 191, 192, 193,
+            ]
+        };
+        for &run in runs {
+            for &suffix in pick(&(0..=40).collect::<Vec<_>>(), &[0, 1, 2, 16, 17]) {
+                for after in afters() {
+                    let mut v = alloc::vec![b'z'; run];
+                    v.push(b'%');
+                    v.extend_from_slice(after);
+                    v.resize(v.len() + suffix, b'z');
+                    check_decode_both(&v);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn decode_back_to_back_escapes() {
+        // Runs of escapes crossing every window boundary at every phase.
+        for unit in [&b"%41"[..], b"%%41", b"%4%41", b"%e2%82%ac"].iter() {
+            for prefix in 0..=3 {
+                for &count in pick(&(0..=24).collect::<Vec<_>>(), &[0, 1, 5, 10, 11]) {
+                    for suffix in 0..=if cfg!(miri) { 1 } else { 3 } {
+                        let mut v = alloc::vec![b'x'; prefix];
+                        for _ in 0..count {
+                            v.extend_from_slice(unit);
+                        }
+                        v.resize(v.len() + suffix, b'x');
+                        check_decode_both(&v);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check every encoding entry point against `reference_encode`.
+    fn check_encode(input: &[u8], set: &'static AsciiSet) {
+        let expected = reference_encode(input, set);
+        let encoded = percent_encode(input, set);
+        assert_eq!(alloc::format!("{}", encoded), expected, "{:?}", input);
+        assert_eq!(encoded.clone().collect::<String>(), expected, "{:?}", input);
+        let mut by_next = String::new();
+        for chunk in encoded.clone() {
+            by_next.push_str(chunk);
+        }
+        assert_eq!(by_next, expected, "{:?}", input);
+        let cow = Cow::from(encoded);
+        assert_eq!(cow, expected, "{:?}", input);
+        assert_eq!(
+            matches!(cow, Cow::Borrowed(_)),
+            expected.as_bytes() == input
+        );
+    }
+
+    #[test]
+    fn encode_block_boundaries() {
+        // `encode_chunks` encodes 32-byte blocks into a 97-byte buffer with
+        // 4-byte stores; the last store of a block where the first 31 bytes
+        // were encoded starts at 93. 0xFF reads the last table entry plus
+        // the padding byte (765..769).
+        let sets: [&'static AsciiSet; 3] = [NON_ALPHANUMERIC, &AsciiSet::EMPTY, CONTROLS];
+        let lengths = pick(
+            &[0, 1, 15, 16, 17, 31, 32, 33, 47, 48, 63, 64, 65, 95, 96, 97],
+            &[0, 1, 16, 31, 32, 33, 65],
+        );
+        for &set in pick(&sets, &sets[..2]) {
+            for &len in lengths {
+                // Everything encoded, ending in 0xFF.
+                check_encode(&alloc::vec![0xFF; len], set);
+                let high: Vec<u8> = (0..len).map(|i| 0xFF - (i % 128) as u8).collect();
+                check_encode(&high, set);
+                let low: Vec<u8> = (0..len).map(|i| (i % 128) as u8).collect();
+                check_encode(&low, set);
+                // Everything encoded but one byte, at each position.
+                for p in 0..if cfg!(miri) && len != 32 { 0 } else { len } {
+                    let mut v = alloc::vec![0xFF; len];
+                    v[p] = b'a';
+                    check_encode(&v, set);
+                }
+                // A clean prefix just below and at the direct-write
+                // threshold (16), so blocks start at different offsets.
+                for &clean in &[15, 16, 17] {
+                    let mut v = alloc::vec![b'a'; clean];
+                    v.resize(clean + len, 0xFF);
+                    check_encode(&v, set);
+                }
+            }
+            // Every combination of encoded / unencoded for the last 5 bytes
+            // of a block whose first 27 bytes are encoded (the largest
+            // offsets of the 4-byte stores), with 0 or 1 following bytes.
+            for bits in 0..32u32 {
+                for &trail in pick(&[0, 1, 33], &[0, 1]) {
+                    let mut v = alloc::vec![0xFF; 27];
+                    v.extend((0..5).map(|i| if bits >> i & 1 != 0 { 0xFF } else { b'b' }));
+                    v.resize(v.len() + trail, b'c');
+                    check_encode(&v, set);
+                }
+            }
+            // Every byte value, in both orders.
+            let all: Vec<u8> = (0..=255).collect();
+            check_encode(&all, set);
+            let rev: Vec<u8> = (0..=255).rev().collect();
+            check_encode(&rev, set);
+        }
+    }
+
     #[test]
     fn percent_encode_byte() {
         for i in 0..=0xFF {
