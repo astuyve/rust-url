@@ -8,6 +8,9 @@ repository = "https://github.com/servo/rust-url/"
 license = "MIT OR Apache-2.0"
 edition = "2018"
 rust-version = "1.51"
+# Benchmarks and their results are for development only; keep them out of the
+# published crate.
+exclude = ["BENCHMARKS.md", "benches/"]
 
 [features]
 default = ["std"]
